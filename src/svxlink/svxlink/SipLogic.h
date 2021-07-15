@@ -55,6 +55,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #include <AsyncAudioPassthrough.h>
 #include <AsyncAudioValve.h>
 #include <AsyncAudioReader.h>
+#include <AsyncAudioMixer.h>
 
 
 /****************************************************************************
@@ -163,6 +164,7 @@ class SipLogic : public LogicBase
     virtual void playTone(int fq, int amp, int len);
     virtual void playDtmf(const std::string& digits, int amp, int len);    
     virtual void initCall(const std::string& remote);
+     
 
     void setReportEventsAsIdle(bool idle) { report_events_as_idle = idle; }
 
@@ -177,11 +179,17 @@ class SipLogic : public LogicBase
   private:
     std::string               m_sipserver;
     Async::AudioPassthrough*  m_logic_con_in;
+    
     Async::AudioSource*       m_logic_con_out;
     Async::AudioPassthrough*  m_out_src;
     Async::AudioValve*        m_outto_sip;
+    Async::AudioValve*        m_outto_sip1;
+
     Async::AudioValve*        m_infrom_sip;
+    Async::AudioValve*        m_infrom_sip1;
     Async::AudioReader*       m_ar;
+    Async::AudioFifo* 	  m_logic_con_in_fifo;
+    bool			  output_packet;
     bool                      m_autoanswer;
     uint16_t                  m_sip_port;
     sip::_Account             *acc;
@@ -201,7 +209,14 @@ class SipLogic : public LogicBase
     bool                      report_events_as_idle;
     bool                      startup_finished;
     Async::AudioSelector      *selector;
+    Async::AudioSelector      *selector_out;
+
     bool                      semi_duplex;
+    int			  Wait_for_start;
+    Async::AudioMixer	      	    *tx_audio_mixer;
+  // fix for static memory no dynamic memory crash.
+    float smpl[1500] ={ 0 } ;
+    float smpl_in[1500] ={ 0 } ;
 
     SipLogic(const SipLogic&);
     SipLogic& operator=(const SipLogic&);
@@ -222,6 +237,7 @@ class SipLogic : public LogicBase
     void callTimeout(Async::Timer *t=0);
     void flushTimeout(Async::Timer *t=0);
     void onSquelchOpen(bool is_open);
+
 
 };  /* class SipLogic */
 

@@ -204,6 +204,7 @@ class RepeaterLogic : public Logic
     std::string     open_reason;
     int		    ident_nag_min_time;
     Async::Timer    ident_nag_timer;
+    int 	      callers;
     
     void idleTimeout(Async::Timer *t);
     void setIdle(bool idle);

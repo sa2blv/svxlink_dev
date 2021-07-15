@@ -179,7 +179,7 @@ namespace sip {
         : slogic(logic)
       {
         createMediaPort(frameTimeLength);
-        registerMediaPort(&mediaPort);
+        registerMediaPort(&this->mediaPort);
       }
 
       ~_AudioMedia()
@@ -227,6 +227,7 @@ namespace sip {
         mediaPort.port_data.pdata = &slogic;
         mediaPort.get_frame = &callback_getFrame;
         mediaPort.put_frame = &callback_putFrame;
+		
 
       } /* _AudioMedia::createMediaPort */
   };
@@ -298,6 +299,11 @@ SipLogic::~SipLogic(void)
   msg_handler = 0;
   delete selector;
   selector = 0;
+  
+  
+  delete m_logic_con_in_fifo;
+  m_logic_con_in_fifo=0;
+  
   for (std::vector<sip::_Call *>::iterator it=calls.begin();
           it != calls.end(); it++)
   {
@@ -530,7 +536,10 @@ bool SipLogic::initialize(void)
   // Sip transport layer creation
   try {
     TransportConfig tcfg;
+
     tcfg.port = m_sip_port;
+//    tcfg.setPort(0); 
+    tcfg.port = 0;
     ep.transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
     ep.libStart();
   } catch (Error& err) {
@@ -574,6 +583,14 @@ bool SipLogic::initialize(void)
   // handler for incoming sip audio stream
   m_out_src = new AudioPassthrough;
   AudioSource *prev_src = m_out_src;
+  
+  m_infrom_sip1 = new AudioValve;
+  m_infrom_sip1->setOpen(false);
+  prev_src->registerSink(m_infrom_sip1, true);
+  prev_src = m_infrom_sip1;
+  
+  
+  
 
    // Create jitter FIFO if jitter buffer delay > 0
   unsigned jitter_buffer_delay = 0;
@@ -581,11 +598,14 @@ bool SipLogic::initialize(void)
   if (jitter_buffer_delay > 0)
   {
     AudioFifo *fifo = new Async::AudioFifo(
-        2 * jitter_buffer_delay * INTERNAL_SAMPLE_RATE / 1000);
+        10 * jitter_buffer_delay * INTERNAL_SAMPLE_RATE / 1000);
         //new Async::AudioJitterFifo(100 * INTERNAL_SAMPLE_RATE / 1000);
-    fifo->setPrebufSamples(jitter_buffer_delay * INTERNAL_SAMPLE_RATE / 1000);
+       fifo->setPrebufSamples(jitter_buffer_delay * INTERNAL_SAMPLE_RATE / 1000);
+	fifo->enableBuffering(true);
+	fifo->setOverwrite(false);
     prev_src->registerSink(fifo, true);
     prev_src = fifo;
+
   }
   else
   {
@@ -623,7 +643,7 @@ bool SipLogic::initialize(void)
     }
     else
     {
-      squelch_det->setHangtime(1300);
+      squelch_det->setHangtime(800);
     }
     squelch_det->squelchOpen.connect(mem_fun(*this, &SipLogic::onSquelchOpen));
     splitter->addSink(squelch_det, true);
@@ -641,10 +661,14 @@ bool SipLogic::initialize(void)
     // Create the message handler for announcements
   msg_handler = new MsgHandler(INTERNAL_SAMPLE_RATE);
   msg_handler->allMsgsWritten.connect(mem_fun(*this, &SipLogic::allMsgsWritten));
+  int conf1;
+  if(!cfg().getValue(name(), "Play_on_phone",conf1))
+  {
+    selector->addSource(msg_handler);
+    selector->enableAutoSelect(msg_handler,10);
+    selector->setFlushWait(msg_handler,false);
+ }
 
-  selector->addSource(msg_handler);
-  selector->enableAutoSelect(msg_handler,10);
-  selector->setFlushWait(msg_handler,false);
 
   m_logic_con_out = selector;
 
@@ -674,21 +698,66 @@ bool SipLogic::initialize(void)
   }
   
   /*************** outgoing to sip ********************/
+  
+
 
    // handler for audio stream from logic to sip
   m_logic_con_in = new Async::AudioPassthrough;
-
+  output_packet = false;
+  
+  
+  // added fifo for buffer because the threads are not running in same time domain
+  // and fix for buffer between threads.
+	
+  m_logic_con_in_fifo = new Async::AudioFifo(
+	2 * 2000 * INTERNAL_SAMPLE_RATE / 1000);
+		
+   m_logic_con_in_fifo->setPrebufSamples(200 * INTERNAL_SAMPLE_RATE / 1000);
+   m_logic_con_in_fifo->enableBuffering(true);
+   m_logic_con_in_fifo->setOverwrite(true);
+	 
    // the audio valve to control the incoming samples
-  m_outto_sip = new AudioValve;
-  m_outto_sip->setOpen(false);
+   m_outto_sip = new AudioValve;
+   m_outto_sip->setBlockWhenClosed(false);
+   m_outto_sip->setOpen(false);
+
+// audio input
+
+
+  selector_out = new Async::AudioSelector;
+  selector_out->addSource(m_logic_con_in);
+  selector_out->enableAutoSelect(m_logic_con_in,0);
+
+
+  selector_out->addSource(msg_handler);
+  selector_out->enableAutoSelect(msg_handler,10);
+  selector_out->setFlushWait(msg_handler,false);
+
+
+
+
+   // Create the TX audio mixer
+  tx_audio_mixer = new AudioMixer;
+  tx_audio_mixer->addSource(m_logic_con_in);
+  int conf;
+  if(cfg().getValue(name(), "Play_on_phone",conf)) 
+  {
+    tx_audio_mixer->addSource(selector_out);
+  }
+  tx_audio_mixer->registerSink(m_outto_sip,true);
+  
+  m_outto_sip->registerSink(m_logic_con_in_fifo,true);
+
 
    // the Audio reader to get and handle the samples later
    // when connected
+/*
   m_ar = new AudioReader;
-  m_ar->registerSource(m_outto_sip);
+  m_ar->registerSource(m_logic_con_in_fifo);
 
-  m_logic_con_in->registerSink(m_outto_sip, true);
-
+  */
+  Wait_for_start=0;
+  
    // init this Logic
   if (!LogicBase::initialize())
   {
@@ -745,6 +814,7 @@ void SipLogic::makeCall(sip::_Account *acc, std::string dest_uri)
     processEvent(ss.str());
     return;
   }
+
 
   ss << "calling \"" << dest_uri << "\"";
   processEvent(ss.str());
@@ -823,7 +893,8 @@ void SipLogic::onMediaState(sip::_Call *call, pj::OnCallMediaStateParam &prm)
         sip_buf = static_cast<pj::AudioMedia *>(call->getMedia(0));
         sip_buf->startTransmit(*media);
         media->startTransmit(*sip_buf);
-        m_outto_sip->setOpen(true);
+        
+		m_outto_sip->setOpen(true);
         m_infrom_sip->setOpen(semi_duplex);      
       }
     }
@@ -858,24 +929,125 @@ void SipLogic::onMediaState(sip::_Call *call, pj::OnCallMediaStateParam &prm)
 /*
  * incoming SvxLink audio stream to SIP client
  */
+
 pj_status_t SipLogic::mediaPortGetFrame(pjmedia_port *port, pjmedia_frame *frame)
 {
 
+/*
+* Start audio read with pjsip thread
+*
+*/
+
+if(Wait_for_start == 0)
+{
+
+   // the audio valve to control the incoming samples
+  m_outto_sip1 = new AudioValve;
+  m_outto_sip1->setBlockWhenClosed(true);
+  m_outto_sip1->setOpen(false);
+  m_outto_sip1->registerSource(m_logic_con_in_fifo);
+
+  m_ar = new AudioReader;
+  m_ar->registerSource(m_outto_sip1);
+  
+  
+  
+ Wait_for_start =1;
+ 
+ } 
+
   int got = 0;
   int count = frame->size / 2 / PJMEDIA_PIA_CCNT(&port->info);
-  float* smpl = new float[count+1]();
+
+  
+  //moved to h file
+  // fix for static memory no dynamic memory crash "memory leak fix" .
+  // reolace with static to remove stack error float* smpl = new float[count+1]();
+ // added float as  global staic memory  to float smpl[900] ={ 0 } ;
+  // memset(smpl, 0, sizeof(smpl));
+ 
+  
+  
   pj_int16_t *samples = static_cast<pj_int16_t *>(frame->buf);
   frame->type = PJMEDIA_FRAME_TYPE_AUDIO;
+  
+   if(m_logic_con_in_fifo->samplesInFifo(true) >0 )
+   {
+	output_packet  = true;
+   }
+   
 
-  if ((got = m_ar->readSamples(smpl, count)) > 0)
-  {
-    int i = 0;
-    for (float* s = smpl; s < smpl + sizeof(float)*got; s += sizeof(float))
-    {
-      samples[i] = (pj_int16_t)(smpl[i] * 32768);
-      i++;
-    }
-  }
+    // Debug string
+   //cout <<frame->buf <<" fifo :" << m_logic_con_in_fifo->samplesInFifo() << "tot " << m_logic_con_in_fifo->samplesInFifo(true) <<" full "<<m_logic_con_in_fifo->full() << " \r\n";
+
+	//cout << "1";
+	int count_zize =  m_logic_con_in_fifo->samplesInFifo();
+	m_outto_sip1->setOpen(true);
+	if( count < count_zize && output_packet == true )
+	{
+		
+	  // cout << "2";
+	  
+	  // implement fucktion to only read the element stored i fifo if value is to small don't read couses async crash
+	  
+	    if ((got = m_ar->readSamples(smpl, count)) > 0)
+		{  
+			
+			int i = 0;
+		//		cout << "3";
+				for (float* s = smpl; s <= smpl + sizeof(float)*got; s += sizeof(float))
+				{
+					samples[i] = (pj_int16_t)(smpl[i] * 32768);
+					//cout << "4";
+					i++;
+					
+				}
+			  if(i == 0)
+			  {
+				output_packet = false;
+			  }
+	  
+	  
+	  }
+	  
+
+	  
+	  //cout << "5";
+	  
+		
+		
+		
+	}	
+	else
+	{
+	  //cout << "6";
+		if(count_zize >0 && output_packet  == true)
+		{
+		   got = m_ar->readSamples(smpl, (count_zize+1));
+           //smpl = new float[count_zize+1]();		
+		  //got = m_ar->readSamples(smpl, (count_zize));
+		  //cout << "Not full packet \r\n";
+		  output_packet = false;
+		  
+
+		}
+		else
+		{
+		 //cout << "Zero packet \r\n";
+		}
+	}
+	m_outto_sip1->setOpen(false);
+	
+
+
+		 //cout << got << " \r\n";
+
+
+	  //m_outto_sip->flushSamples();
+
+  
+  
+  
 
   /*
     The pjsip framework requests 768 samples on every call. The SvxLink
@@ -884,11 +1056,10 @@ pj_status_t SipLogic::mediaPortGetFrame(pjmedia_port *port, pjmedia_frame *frame
     I can not predict the behaviour if we provide less samples than the
     requested number. So we will fill the buffer with 0
   */
-  while (++got < count)
+  while (++got < (count+1))
   {
     samples[got] = (pj_int16_t) 0;
   }
-
   return PJ_SUCCESS;
 } /* SipLogic::mediaPortGetFrame */
 
@@ -900,17 +1071,30 @@ pj_status_t SipLogic::mediaPortPutFrame(pjmedia_port *port, pjmedia_frame *frame
 {
 
   int count = frame->size / 2 / PJMEDIA_PIA_CCNT(&port->info);
+  
+  //cout <<"size :" << count;
 
   if (count > 0)
   {
+  m_infrom_sip1->setOpen(true);
     pj_int16_t *samples = static_cast<pj_int16_t *>(frame->buf);
     frame->type = PJMEDIA_FRAME_TYPE_AUDIO;
-    float* smpl = new float[count+1]();
+	
+	/*
+	replace smpl with static array for memory lekage fix
+	*/
+	
+    //memset(smpl_in, 0, sizeof(smpl));
     for (int i=0; i < count; i++)
     {
-      smpl[i] = (float) (samples[i] / 32768.0);
+      smpl_in[i] = (float) (samples[i] / 32768.0);
     }
-    m_out_src->writeSamples(smpl, count);
+    m_out_src->writeSamples(smpl_in, count);
+
+  }
+  else
+  {
+	m_infrom_sip1->setOpen(false);
   }
 
   return PJ_SUCCESS;
@@ -948,6 +1132,7 @@ void SipLogic::onCallState(sip::_Call *call, pj::OnCallStateParam &prm)
            << (*it)->getInfo().totalDuration.sec << "."
            << (*it)->getInfo().totalDuration.msec;
         processEvent(ss.str());
+
       }
 
        // incoming call
@@ -955,6 +1140,7 @@ void SipLogic::onCallState(sip::_Call *call, pj::OnCallStateParam &prm)
       {
         ss << "incoming_call " << caller;
         processEvent(ss.str());
+		pj_thread_sleep(40);
       }
 
        // connecting
@@ -964,6 +1150,7 @@ void SipLogic::onCallState(sip::_Call *call, pj::OnCallStateParam &prm)
         processEvent(ss.str());
         m_call_timeout_timer.setEnable(false);
         m_call_timeout_timer.reset();
+		pj_thread_sleep(5);
       }
 
        // calling
@@ -1003,12 +1190,17 @@ void SipLogic::onRegState(sip::_Account *acc, pj::OnRegStateParam &prm)
 void SipLogic::hangupCalls(std::vector<sip::_Call *> calls)
 {
   CallOpParam prm(true);
-
+  ep.hangupAllCalls();
+  pj_thread_sleep(200);
+  
+/*
   for (std::vector<sip::_Call *>::iterator it=calls.begin();
        it != calls.end(); it++)
   {
     hangupCall(*it);
   }
+
+  */
 } /* SipLogic::hangupCalls */
 
 
@@ -1024,10 +1216,12 @@ void SipLogic::hangupCall(sip::_Call *call)
     if (*it == call)
     {
       (*it)->hangup(prm);
-      calls.erase(it);
+        //calls.erase(it);
       break;
     }
   }
+  pj_thread_sleep(400);
+
   m_outto_sip->setOpen(false);
 } /* SipLogic::hangupCall */
 
@@ -1080,6 +1274,7 @@ void SipLogic::flushAudio(void)
 
 void SipLogic::allSamplesFlushed(void)
 {
+
 } /* SipLogic::allSamplesFlushed */
 
 
@@ -1109,6 +1304,7 @@ void SipLogic::callTimeout(Async::Timer *t)
 void SipLogic::flushTimeout(Async::Timer *t)
 {
   m_out_src->allSamplesFlushed();
+  cout << "flush_data \r\n";
 } /* SipLogic::flushTimeout */
 
 
@@ -1122,7 +1318,7 @@ void SipLogic::onSquelchOpen(bool is_open)
 
 void SipLogic::allMsgsWritten(void)
 {
-  //cout << "SipLogic::allMsgsWritten\n";
+  cout << "SipLogic::allMsgsWritten\n";
 
 } /* SipLogic::allMsgsWritten */
 
