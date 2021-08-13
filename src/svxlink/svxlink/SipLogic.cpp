@@ -690,12 +690,30 @@ bool SipLogic::initialize(void)
   event_handler->initCall.connect(mem_fun(*this, &SipLogic::initCall));
   event_handler->processEvent("namespace eval SipLogic {}");
 
+
+  event_handler->processEvent("namespace eval Logic {}");
+  list<string> cfgvars = cfg().listSection(name());
+  list<string>::const_iterator cfgit;
+  for (cfgit=cfgvars.begin(); cfgit!=cfgvars.end(); ++cfgit)
+  {
+    string var = "Logic::CFG_" + *cfgit;
+    string value;
+    cfg().getValue(name(), *cfgit, value);
+    event_handler->setVariable(var, value);
+  }
+
+
+
+
   if (!event_handler->initialize())
   {
     cout << name() << ":*** ERROR initializing eventhandler in SipLogic."
          << endl;
     return false;
   }
+
+
+
   
   /*************** outgoing to sip ********************/
   
